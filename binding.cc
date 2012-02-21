@@ -24,9 +24,6 @@
 #include <node.h>
 #include <node_version.h>
 #include <node_buffer.h>
-#if !NODE_VERSION_AT_LEAST(0, 5, 5)
-#include <ev.h>
-#endif
 #include <zmq.h>
 #include <assert.h>
 #include <stdio.h>
@@ -87,13 +84,9 @@ private:
     struct BindState;
     static Handle<Value> Bind(const Arguments &args);
 
-#if NODE_VERSION_AT_LEAST(0, 5, 4)
-      static void EIO_DoBind(eio_req *req);
-#else
-      static int EIO_DoBind(eio_req *req);
-#endif
+    static void UV_DoBind(uv_work_t *req);
+    static void UV_BindDone(uv_work_t *req);
 
-    static int EIO_BindDone(eio_req *req);
     static Handle<Value> BindSync(const Arguments &args);
 
     static Handle<Value> Connect(const Arguments &args);
@@ -413,28 +406,30 @@ Handle<Value> Socket::SetSockOpt(const Arguments &args) {
 }
 
 
-struct Socket::BindState {
+  struct Socket::BindState {
     BindState(Socket* sock_, Handle<Function> cb_, Handle<String> addr_)
-            : addr(addr_) {
-        sock_obj = Persistent<Object>::New(sock_->handle_);
-        sock = sock_->socket_;
-        cb = Persistent<Function>::New(cb_);
-        error = 0;
+          : addr(addr_) {
+      request.data = this;
+      sock_obj = Persistent<Object>::New(sock_->handle_);
+      sock = sock_->socket_;
+      cb = Persistent<Function>::New(cb_);
+      error = 0;
     }
 
     ~BindState() {
-        sock_obj.Dispose();
-        sock_obj.Clear();
-        cb.Dispose();
-        cb.Clear();
+      sock_obj.Dispose();
+      sock_obj.Clear();
+      cb.Dispose();
+      cb.Clear();
     }
 
+    uv_work_t request;
     Persistent<Object> sock_obj;
     void* sock;
     Persistent<Function> cb;
     String::Utf8Value addr;
     int error;
-};
+  };
 
 Handle<Value> Socket::Bind(const Arguments &args) {
     HandleScope scope;
@@ -450,48 +445,38 @@ Handle<Value> Socket::Bind(const Arguments &args) {
     GET_SOCKET(args);
 
     BindState* state = new BindState(socket, cb, addr);
-    eio_custom(EIO_DoBind, EIO_PRI_DEFAULT, EIO_BindDone, state);
-    ev_ref(EV_DEFAULT_UC);
+
+    //PRAGMA Change
+    uv_queue_work(uv_default_loop(), &state->request, UV_DoBind, UV_BindDone);
+    //eio_custom(EIO_DoBind, EIO_PRI_DEFAULT, EIO_BindDone, state);
+
     socket->state_ = STATE_BUSY;
 
     return Undefined();
 }
 
-#if NODE_VERSION_AT_LEAST(0, 5, 4)
-  void
-#else
-  int
-#endif
-  Socket::EIO_DoBind(eio_req *req) {
-    BindState* state = (BindState*) req->data;
-    if (zmq_bind(state->sock, *state->addr) < 0)
-        state->error = zmq_errno();
-#if !NODE_VERSION_AT_LEAST(0, 5, 4)
-    return 0;
-#endif
-  }
 
-int Socket::EIO_BindDone(eio_req *req) {
-    BindState* state = (BindState*) req->data;
-    HandleScope scope;
+void Socket::UV_DoBind(uv_work_t *req) {
+  BindState* state = static_cast<BindState*>(req->data);
+  if (zmq_bind(state->sock, *state->addr) < 0)
+      state->error = zmq_errno();
+}
 
-    Local<Value> argv[1];
-    if (state->error)
-        argv[0] = Exception::Error(String::New(zmq_strerror(state->error)));
-    else
-        argv[0] = Local<Value>::New(Undefined());
-    Local<Function> cb = Local<Function>::New(state->cb);
+void Socket::UV_BindDone(uv_work_t *req) {
+  BindState* state = static_cast<BindState*>(req->data);
+  HandleScope scope;
 
-    ObjectWrap::Unwrap<Socket>(state->sock_obj)->state_ = STATE_READY;
-    delete state;
+  Local<Value> argv[1];
+  if (state->error) argv[0] = Exception::Error(String::New(zmq_strerror(state->error)));
+  else argv[0] = Local<Value>::New(Undefined());
+  Local<Function> cb = Local<Function>::New(state->cb);
 
-    TryCatch try_catch;
-    cb->Call(v8::Context::GetCurrent()->Global(), 1, argv);
-    if (try_catch.HasCaught())
-        FatalException(try_catch);
+  ObjectWrap::Unwrap<Socket>(state->sock_obj)->state_ = STATE_READY;
+  delete state;
 
-    ev_unref(EV_DEFAULT_UC);
-    return 0;
+  TryCatch try_catch;
+  cb->Call(v8::Context::GetCurrent()->Global(), 1, argv);
+  if (try_catch.HasCaught()) FatalException(try_catch);
 }
 
 Handle<Value> Socket::BindSync(const Arguments &args) {
